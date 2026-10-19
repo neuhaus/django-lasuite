@@ -14,8 +14,10 @@ from django.contrib.sessions.models import Session
 from django.core.cache import cache
 from django.core.exceptions import SuspiciousOperation
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils import crypto, timezone
+from django.utils.cache import add_never_cache_headers
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -55,6 +57,9 @@ class OIDCLogoutView(MozillaOIDCOIDCLogoutView):
     and the subsequent callback.
     """
 
+    # Template of the auto-submitted form used when `OIDC_OP_LOGOUT_USE_POST` is enabled
+    logout_form_template_name = "lasuite/oidc_login/logout_form.html"
+
     @staticmethod
     def persist_state(request, state):
         """
@@ -73,15 +78,15 @@ class OIDCLogoutView(MozillaOIDCOIDCLogoutView):
         request.session.modified = True
         request.session.save()
 
-    def construct_oidc_logout_url(self, request):
+    def get_oidc_logout_request(self, request):
         """
-        Create the redirect URL for interfacing with the OIDC provider.
+        Build the logout request to send to the OIDC provider.
 
-        Retrieves the necessary parameters from the session and constructs the URL
-        required to initiate logout with the OpenID Connect provider.
+        Retrieves the necessary parameters from the session and returns a
+        `(logout_endpoint, parameters)` tuple.
 
-        If no ID token is found in the session, the logout flow will not be initiated,
-        and the method will return the default redirect URL.
+        If no logout endpoint is configured or no ID token is found in the session,
+        the logout flow will not be initiated, and the method will return None.
 
         The 'state' parameter is generated randomly and persisted in the session to ensure
         its integrity during the subsequent callback.
@@ -89,51 +94,87 @@ class OIDCLogoutView(MozillaOIDCOIDCLogoutView):
         oidc_logout_endpoint = self.get_settings("OIDC_OP_LOGOUT_ENDPOINT")
 
         if not oidc_logout_endpoint:
-            return self.redirect_url
+            return None
 
         reverse_url = reverse("oidc_logout_callback")
         id_token = request.session.get("oidc_id_token", None)
 
         if not id_token:
-            return self.redirect_url
+            return None
 
-        query = {
+        parameters = {
             "id_token_hint": id_token,
             "state": crypto.get_random_string(self.get_settings("OIDC_STATE_SIZE", 32)),
             "post_logout_redirect_uri": absolutify(request, reverse_url),
         }
 
-        self.persist_state(request, query["state"])
+        self.persist_state(request, parameters["state"])
 
-        return f"{oidc_logout_endpoint}?{urlencode(query)}"
+        return oidc_logout_endpoint, parameters
+
+    def construct_oidc_logout_response(self, request):
+        """
+        Create the response sending the user to the OIDC provider to start the logout process.
+
+        According to the OpenID Connect RP-Initiated Logout specification, the logout request
+        goes through the user agent for the OIDC provider to end its own session, using:
+        - the HTTP GET method (default): redirects to the OIDC logout endpoint, the parameters
+          being serialized in the URL query string;
+        - the HTTP POST method (`OIDC_OP_LOGOUT_USE_POST` setting enabled): returns an
+          auto-submitted HTML form, the parameters being serialized using Form Serialization.
+
+        If the logout flow cannot be initiated, the method will return None.
+        """
+        logout_request = self.get_oidc_logout_request(request)
+
+        if logout_request is None:
+            return None
+
+        oidc_logout_endpoint, parameters = logout_request
+
+        if not self.get_settings("OIDC_OP_LOGOUT_USE_POST", False):
+            return HttpResponseRedirect(f"{oidc_logout_endpoint}?{urlencode(parameters)}")
+
+        response = TemplateResponse(
+            request,
+            self.logout_form_template_name,
+            {
+                "oidc_logout_endpoint": oidc_logout_endpoint,
+                "parameters": parameters,
+                # Set by django-csp, to allow the auto-submit inline script
+                "csp_nonce": getattr(request, "csp_nonce", None),
+            },
+        )
+        # The page contains the ID token, it must never be cached
+        add_never_cache_headers(response)
+        return response
 
     def post(self, request):
         """
         Handle user logout.
 
         If the user is not authenticated, redirects to the default logout URL.
-        Otherwise, constructs the OIDC logout URL and redirects the user to start
-        the logout process.
+        Otherwise, sends the user to the OIDC provider to start the logout process.
 
-        If the user is redirected to the default logout URL, ensure her Django session
-        is terminated.
+        If the user is not sent to the OIDC provider, ensure her Django session is terminated.
         """
-        logout_url = self.redirect_url
+        logout_response = None
 
         if request.user.is_authenticated:
-            logout_url = self.construct_oidc_logout_url(request)
+            logout_response = self.construct_oidc_logout_response(request)
 
-        # If the user is not redirected to the OIDC provider, ensure logout
-        if logout_url == self.redirect_url:
+        # If the user is not sent to the OIDC provider, ensure logout
+        if logout_response is None:
             auth.logout(request)
-        else:
-            # Force final session save before redirect to SSO
-            # This ensures the logout state generated in construct_oidc_logout_url()
-            # is persisted in Redis before the browser redirects
-            request.session.modified = True
-            request.session.save()
+            return HttpResponseRedirect(self.redirect_url)
 
-        return HttpResponseRedirect(logout_url)
+        # Force final session save before sending the user to SSO
+        # This ensures the logout state generated in get_oidc_logout_request()
+        # is persisted in Redis before the browser leaves
+        request.session.modified = True
+        request.session.save()
+
+        return logout_response
 
 
 class OIDCLogoutCallbackView(MozillaOIDCOIDCLogoutView):
@@ -697,19 +738,41 @@ class OIDCAuthenticationCallbackView(MozillaOIDCAuthenticationCallbackView):
     """Custom callback view for handling silent login failure with state validation."""
 
     def get(self, request):
-        """Handle silent login failure with CSRF protection via state validation."""
+        """
+        Handle the login callback, including silent login failures and
+        replayed or unknown state parameters.
+        """
         error = request.GET.get("error")
         state = request.GET.get("state")
 
         # Validate state parameter even during silent login failures to prevent CSRF
         if error == "login_required" and request.session.get("silent"):
             if state and state in request.session.get("oidc_states", {}):
-                # Keep state for potential subsequent SSO callback with authorization code
-                del request.session["silent"]
-                request.session.save()
-                return HttpResponseRedirect(self.success_url)
+                # success_url reads the session: compute it before the clean up
+                redirect_url = self.success_url
+                self.clean_up_silent_login(state)
+                return HttpResponseRedirect(redirect_url)
             msg = "OIDC callback state validation failed during silent login"
             raise SuspiciousOperation(msg)
+
+        # mozilla-django-oidc raises a SuspiciousOperation (HTTP 400) when an
+        # authorization code callback carries a state that is missing from the
+        # session: missing or empty `oidc_states` key, or unknown state value.
+        # In production this is most often a replay of the callback url
+        # (browser refresh, back navigation or a duplicate redirect from the
+        # identity provider) after a first callback request already consumed
+        # the state. This is harmless and should not produce an error page,
+        # so we abort the login before exchanging the authorization code.
+        if error is None and "code" in request.GET and state and state not in request.session.get("oidc_states", {}):
+            logger.warning(
+                "OIDC callback received an unknown state parameter: the state was"
+                " already consumed or the session changed between the"
+                " authentication request and the callback. Aborting login"
+                " gracefully."
+            )
+            if request.user.is_authenticated:
+                return HttpResponseRedirect(self.success_url)
+            return self.login_failure()
 
         return super().get(request)
 
@@ -723,12 +786,46 @@ class OIDCAuthenticationCallbackView(MozillaOIDCAuthenticationCallbackView):
         really a failure - it just means the user needs to log in manually.
         """
         if self.request.session.get("silent", None):
-            # Clean up silent flag
-            del self.request.session["silent"]
-            self.request.session.save()
-            # Redirect to success URL (homepage) instead of failure page
-            return self.success_url
+            # Redirect to success URL (homepage) instead of failure page.
+            # success_url reads the session: compute it before the clean up
+            redirect_url = self.success_url
+            self.clean_up_silent_login(self.request.GET.get("state"))
+            return redirect_url
         return super().failure_url
+
+    def clean_up_silent_login(self, state):
+        """
+        Remove what a failed silent login left in the session.
+
+        The `oidc_states` entry of this state is always removed: an authorization
+        response is final, the identity provider never sends a second callback
+        for the same state. The `silent` flag and `oidc_login_next` are shared by
+        all the flows of the session, so they are only removed when no other
+        flow is pending (e.g. a silent login started in another tab).
+
+        An anonymous visitor would otherwise keep a session holding nothing but
+        leftover OIDC data: when the session ends up empty, it is flushed so the
+        record is deleted from the store and the session cookie is removed.
+        """
+        session = self.request.session
+
+        oidc_states = session.get("oidc_states")
+        if isinstance(oidc_states, dict):
+            oidc_states.pop(state, None)
+            if oidc_states:
+                session.modified = True
+                session.save()
+                return
+        session.pop("oidc_states", None)
+        session.pop("silent", None)
+        session.pop("oidc_login_next", None)
+
+        if not self.request.user.is_authenticated and not session.keys():
+            session.flush()
+            return
+
+        session.modified = True
+        session.save()
 
 
 class OIDCAuthenticationRequestView(MozillaOIDCAuthenticationRequestView):

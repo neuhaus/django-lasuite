@@ -7,18 +7,21 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 import responses
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user, get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.contrib.sessions.models import Session
 from django.core.exceptions import SuspiciousOperation
+from django.http import HttpResponseRedirect
 from django.test import RequestFactory
 from django.urls import reverse
-from django.utils import crypto
+from django.utils import crypto, translation
 from joserfc import jwt
 from joserfc.jwk import RSAKey
+from pytest_django.asserts import assertInHTML
 from rest_framework.test import APIClient
 
+from lasuite.oidc_login.backends import OIDCAuthenticationBackend
 from lasuite.oidc_login.views import (
     OIDCAuthenticationCallbackView,
     OIDCAuthenticationRequestView,
@@ -48,9 +51,13 @@ def test_view_logout_anonymous(settings):
     assert response.url == "/example-logout"
 
 
-@mock.patch.object(OIDCLogoutView, "construct_oidc_logout_url", return_value="/example-logout")
-def test_view_logout(mocked_oidc_logout_url, settings):
-    """Authenticated users should be redirected to OIDC provider for logout."""
+@mock.patch.object(
+    OIDCLogoutView,
+    "construct_oidc_logout_response",
+    return_value=HttpResponseRedirect("https://oidc.example.com/logout"),
+)
+def test_view_logout(mocked_oidc_logout_response, settings):
+    """Authenticated users should be sent to OIDC provider for logout."""
     settings.ALLOW_LOGOUT_GET_METHOD = True
     settings.LOGOUT_REDIRECT_URL = "/example-logout"
 
@@ -60,16 +67,18 @@ def test_view_logout(mocked_oidc_logout_url, settings):
     client.force_login(user)
 
     url = reverse("oidc_logout_custom")
-    response = client.get(url)
 
-    mocked_oidc_logout_url.assert_called_once()
+    with mock.patch("mozilla_django_oidc.views.auth.logout") as mock_logout:
+        response = client.get(url)
+        mocked_oidc_logout_response.assert_called_once()
+        mock_logout.assert_not_called()
 
     assert response.status_code == 302
-    assert response.url == "/example-logout"
+    assert response.url == "https://oidc.example.com/logout"
 
 
-@mock.patch.object(OIDCLogoutView, "construct_oidc_logout_url", return_value="/default-redirect-logout")
-def test_view_logout_no_oidc_provider(mocked_oidc_logout_url, settings):
+@mock.patch.object(OIDCLogoutView, "construct_oidc_logout_response", return_value=None)
+def test_view_logout_no_oidc_provider(mocked_oidc_logout_response, settings):
     """Authenticated users should be logged out when no OIDC provider is available."""
     settings.ALLOW_LOGOUT_GET_METHOD = True
     settings.LOGOUT_REDIRECT_URL = "/default-redirect-logout"
@@ -83,7 +92,7 @@ def test_view_logout_no_oidc_provider(mocked_oidc_logout_url, settings):
 
     with mock.patch("mozilla_django_oidc.views.auth.logout") as mock_logout:
         response = client.get(url)
-        mocked_oidc_logout_url.assert_called_once()
+        mocked_oidc_logout_response.assert_called_once()
         mock_logout.assert_called_once()
 
     assert response.status_code == 302
@@ -161,9 +170,9 @@ def test_view_logout_persist_state(initial_oidc_states):
 
 @mock.patch.object(OIDCLogoutView, "persist_state")
 @mock.patch.object(crypto, "get_random_string", return_value="mocked_state")
-def test_view_logout_construct_oidc_logout_url(mocked_get_random_string, mocked_persist_state, settings):
-    """Should construct the logout URL to initiate the logout flow with the OIDC provider."""
-    settings.OIDC_OP_LOGOUT_ENDPOINT = "/example-logout"
+def test_view_logout_construct_oidc_logout_response(mocked_get_random_string, mocked_persist_state, settings):
+    """Should redirect to the logout URL to initiate the logout flow with the OIDC provider."""
+    settings.OIDC_OP_LOGOUT_ENDPOINT = "https://oidc.example.com/logout"
 
     user = factories.UserFactory()
 
@@ -176,26 +185,25 @@ def test_view_logout_construct_oidc_logout_url(mocked_get_random_string, mocked_
     request.session["oidc_id_token"] = "mocked_oidc_id_token"
     request.session.save()
 
-    redirect_url = OIDCLogoutView().construct_oidc_logout_url(request)
+    response = OIDCLogoutView().construct_oidc_logout_response(request)
 
-    mocked_persist_state.assert_called_once()
+    mocked_persist_state.assert_called_once_with(request, "mocked_state")
     mocked_get_random_string.assert_called_once()
 
-    params = parse_qs(urlparse(redirect_url).query)
+    assert response.status_code == 302
+    assert response.url.startswith("https://oidc.example.com/logout?")
+    assert parse_qs(urlparse(response.url).query) == {
+        "id_token_hint": ["mocked_oidc_id_token"],
+        "state": ["mocked_state"],
+        "post_logout_redirect_uri": ["http://testserver/logout-callback/"],
+    }
 
-    assert params["id_token_hint"][0] == "mocked_oidc_id_token"
-    assert params["state"][0] == "mocked_state"
 
-    url = reverse("oidc_logout_callback")
-    assert url in params["post_logout_redirect_uri"][0]
-
-
-def test_view_logout_construct_oidc_logout_url_none_id_token(settings):
-    """
-    If no ID token is available in the session,
-    the user should be redirected to the final URL.
-    """
-    settings.LOGOUT_REDIRECT_URL = "/"
+@pytest.mark.parametrize("use_post", [True, False])
+def test_view_logout_construct_oidc_logout_response_none_id_token(use_post, settings):
+    """If no ID token is available in the session, the logout flow should not be initiated."""
+    settings.OIDC_OP_LOGOUT_ENDPOINT = "https://oidc.example.com/logout"
+    settings.OIDC_OP_LOGOUT_USE_POST = use_post
     user = factories.UserFactory()
 
     request = RequestFactory().request()
@@ -204,9 +212,174 @@ def test_view_logout_construct_oidc_logout_url_none_id_token(settings):
     middleware = SessionMiddleware(get_response=lambda x: x)
     middleware.process_request(request)
 
-    redirect_url = OIDCLogoutView().construct_oidc_logout_url(request)
+    assert OIDCLogoutView().construct_oidc_logout_response(request) is None
 
-    assert redirect_url == "/"
+
+@mock.patch.object(crypto, "get_random_string", return_value="mocked_state")
+def test_view_logout_get_method_redirects_to_oidc_provider(mocked_get_random_string, settings):
+    """By default, authenticated users should be redirected to the OIDC logout URL with query parameters."""
+    settings.LOGOUT_REDIRECT_URL = "/example-logout"
+    settings.OIDC_OP_LOGOUT_ENDPOINT = "https://oidc.example.com/logout"
+
+    user = factories.UserFactory()
+
+    client = APIClient()
+    client.force_login(user)
+    session = client.session
+    session["oidc_id_token"] = "mocked_oidc_id_token"
+    session.save()
+
+    response = client.post(reverse("oidc_logout_custom"))
+
+    assert response.status_code == 302
+    assert response.url.startswith("https://oidc.example.com/logout?")
+    assert parse_qs(urlparse(response.url).query) == {
+        "id_token_hint": ["mocked_oidc_id_token"],
+        "state": ["mocked_state"],
+        "post_logout_redirect_uri": ["http://testserver/logout-callback/"],
+    }
+
+    # The Django session is kept until the logout callback
+    assert client.session["_auth_user_id"] == str(user.pk)
+    assert client.session["oidc_states"] == {"mocked_state": {}}
+
+
+@mock.patch.object(crypto, "get_random_string", return_value="mocked_state")
+def test_view_logout_post_method_returns_auto_submitted_form(mocked_get_random_string, settings):
+    """
+    When OIDC_OP_LOGOUT_USE_POST is enabled, authenticated users should get a form
+    sending the logout request parameters to the OIDC provider with the POST method.
+    """
+    settings.LOGOUT_REDIRECT_URL = "/example-logout"
+    settings.OIDC_OP_LOGOUT_ENDPOINT = "https://oidc.example.com/logout"
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+
+    user = factories.UserFactory()
+
+    client = APIClient()
+    client.force_login(user)
+    session = client.session
+    session["oidc_id_token"] = "mocked_oidc_id_token"
+    session.save()
+
+    response = client.post(reverse("oidc_logout_custom"))
+
+    assert response.status_code == 200
+    assert response["Content-Type"] == "text/html; charset=utf-8"
+    assert "no-store" in response["Cache-Control"]
+
+    content = response.content.decode()
+    assertInHTML(
+        '<form id="oidc-logout-form" method="post" action="https://oidc.example.com/logout">'
+        '<input type="hidden" name="id_token_hint" value="mocked_oidc_id_token">'
+        '<input type="hidden" name="state" value="mocked_state">'
+        '<input type="hidden" name="post_logout_redirect_uri" value="http://testserver/logout-callback/">'
+        '<button type="submit">Continue</button>'
+        "</form>",
+        content,
+    )
+    assert '<script>document.getElementById("oidc-logout-form").submit();</script>' in content
+
+    # The Django session is kept until the logout callback
+    assert client.session["_auth_user_id"] == str(user.pk)
+    assert client.session["oidc_states"] == {"mocked_state": {}}
+
+
+@pytest.mark.parametrize(
+    ("logout_endpoint", "id_token"),
+    [
+        (None, "mocked_oidc_id_token"),
+        ("https://oidc.example.com/logout", None),
+    ],
+)
+def test_view_logout_post_method_cannot_initiate_logout_flow(logout_endpoint, id_token, settings):
+    """
+    When OIDC_OP_LOGOUT_USE_POST is enabled but the logout flow cannot be initiated,
+    users should be logged out and redirected to LOGOUT_REDIRECT_URL.
+    """
+    settings.LOGOUT_REDIRECT_URL = "/example-logout"
+    settings.OIDC_OP_LOGOUT_ENDPOINT = logout_endpoint
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+
+    user = factories.UserFactory()
+
+    client = APIClient()
+    client.force_login(user)
+    if id_token:
+        session = client.session
+        session["oidc_id_token"] = id_token
+        session.save()
+
+    response = client.post(reverse("oidc_logout_custom"))
+
+    assert response.status_code == 302
+    assert response.url == "/example-logout"
+    assert "_auth_user_id" not in client.session
+
+
+def test_view_logout_post_method_anonymous(settings):
+    """When OIDC_OP_LOGOUT_USE_POST is enabled, anonymous users should be redirected to LOGOUT_REDIRECT_URL."""
+    settings.LOGOUT_REDIRECT_URL = "/example-logout"
+    settings.OIDC_OP_LOGOUT_ENDPOINT = "https://oidc.example.com/logout"
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+
+    response = APIClient().post(reverse("oidc_logout_custom"))
+
+    assert response.status_code == 302
+    assert response.url == "/example-logout"
+
+
+@mock.patch.object(
+    OIDCLogoutView,
+    "get_oidc_logout_request",
+    return_value=('https://oidc.example.com/logout?a=1&b="2"', {"state": '"><script>alert(1)</script>'}),
+)
+def test_view_logout_construct_oidc_logout_response_post_escapes_values(mocked_logout_request, settings):
+    """The logout form should escape the endpoint and the parameters values."""
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+    request = RequestFactory().post("/logout/")
+
+    response = OIDCLogoutView().construct_oidc_logout_response(request).render()
+
+    content = response.content.decode()
+    assert "<script>alert(1)</script>" not in content
+    assert 'action="https://oidc.example.com/logout?a=1&amp;b=&quot;2&quot;"' in content
+    assert 'value="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"' in content
+
+
+@mock.patch.object(
+    OIDCLogoutView,
+    "get_oidc_logout_request",
+    return_value=("https://oidc.example.com/logout", {"state": "mocked_state"}),
+)
+def test_view_logout_construct_oidc_logout_response_post_csp_nonce(mocked_logout_request, settings):
+    """The auto-submit script should use the CSP nonce when available on the request."""
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+    request = RequestFactory().post("/logout/")
+    request.csp_nonce = "mocked-nonce"
+
+    response = OIDCLogoutView().construct_oidc_logout_response(request).render()
+
+    assert '<script nonce="mocked-nonce">' in response.content.decode()
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+@mock.patch.object(
+    OIDCLogoutView,
+    "get_oidc_logout_request",
+    return_value=("https://oidc.example.com/logout", {"state": "mocked_state"}),
+)
+def test_view_logout_construct_oidc_logout_response_post_lang(mocked_logout_request, language, settings):
+    """The logout page should declare the active language."""
+    settings.OIDC_OP_LOGOUT_USE_POST = True
+    request = RequestFactory().post("/logout/")
+
+    with translation.override(language):
+        response = OIDCLogoutView().construct_oidc_logout_response(request).render()
+
+    content = response.content.decode()
+    assert content.startswith("<!DOCTYPE html>")
+    assert f'<html lang="{language}">' in content
 
 
 @pytest.mark.parametrize(
@@ -1048,7 +1221,7 @@ def test_view_callback_silent_login_with_missing_state():
     return_value="/homepage/",
 )
 def test_view_callback_silent_login_with_valid_state(mocked_success_url):
-    """Silent login failure with valid state should redirect and keep state for potential retry."""
+    """Silent login failure with valid state should redirect and consume the state."""
     user = factories.UserFactory()
 
     request = RequestFactory().get("/callback/", data={"error": "login_required", "state": "valid_state"})
@@ -1071,7 +1244,277 @@ def test_view_callback_silent_login_with_valid_state(mocked_success_url):
     assert response.url == "/homepage/"
     # The silent flag should be cleaned up
     assert not request.session.get("silent")
-    # CRITICAL: The state should NOT be deleted on error=login_required
-    # because the SSO provider might send another callback with the actual code
-    # using the same state shortly after
-    assert "valid_state" in request.session.get("oidc_states", {})
+    # The state is consumed: the identity provider never sends a second
+    # callback for the same authorization request
+    assert "oidc_states" not in request.session
+    # The session of an authenticated user is kept
+    assert request.session.session_key is not None
+
+
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "failure_url",
+    new_callable=mock.PropertyMock,
+    return_value="/failure/",
+)
+def test_view_callback_with_unknown_state_anonymous(mocked_failure_url):
+    """
+    An authorization code callback with a state unknown to the session should
+    abort the login gracefully instead of raising a SuspiciousOperation.
+
+    This happens in production when the callback url is replayed (browser
+    refresh, back navigation or a duplicate redirect from the identity
+    provider) after a first callback request already consumed the state.
+    """
+    request = RequestFactory().get("/callback/", data={"code": "some-code", "state": "unknown-state"})
+    request.user = AnonymousUser()
+
+    middleware = SessionMiddleware(get_response=lambda x: x)
+    middleware.process_request(request)
+
+    request.session["oidc_states"] = {"known-state": {"nonce": "nonce"}}
+    request.session.save()
+
+    with mock.patch("django.contrib.auth.authenticate") as mocked_authenticate:
+        response = OIDCAuthenticationCallbackView.as_view()(request)
+
+    mocked_failure_url.assert_called_once()
+    mocked_authenticate.assert_not_called()
+    assert response.status_code == 302
+    assert response.url == "/failure/"
+    # The session should be left untouched
+    assert request.session["oidc_states"] == {"known-state": {"nonce": "nonce"}}
+
+
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "success_url",
+    new_callable=mock.PropertyMock,
+    return_value="/homepage/",
+)
+def test_view_callback_with_unknown_state_authenticated(mocked_success_url):
+    """
+    An authorization code callback with a state unknown to the session for an
+    already authenticated user should redirect to the success url.
+
+    This is the typical case of a replayed callback after the first request
+    successfully logged the user in.
+    """
+    request = RequestFactory().get("/callback/", data={"code": "some-code", "state": "unknown-state"})
+    request.user = factories.UserFactory()
+
+    middleware = SessionMiddleware(get_response=lambda x: x)
+    middleware.process_request(request)
+
+    request.session["oidc_states"] = {"known-state": {"nonce": "nonce"}}
+    request.session.save()
+
+    with mock.patch("django.contrib.auth.authenticate") as mocked_authenticate:
+        response = OIDCAuthenticationCallbackView.as_view()(request)
+
+    mocked_success_url.assert_called_once()
+    mocked_authenticate.assert_not_called()
+    assert response.status_code == 302
+    assert response.url == "/homepage/"
+
+
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "failure_url",
+    new_callable=mock.PropertyMock,
+    return_value="/failure/",
+)
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "success_url",
+    new_callable=mock.PropertyMock,
+    return_value="/homepage/",
+)
+@pytest.mark.parametrize(
+    "session_oidc_states",
+    [
+        None,  # missing 'oidc_states' key
+        {},  # empty 'oidc_states' dictionary
+    ],
+    ids=["missing_key", "empty_dict"],
+)
+@pytest.mark.parametrize("is_authenticated", [False, True], ids=["anonymous", "authenticated"])
+def test_view_callback_with_empty_or_missing_oidc_states(
+    mocked_success_url, mocked_failure_url, is_authenticated, session_oidc_states
+):
+    """
+    A callback with a state that cannot be found in the session should fail
+    gracefully whether the `oidc_states` key is missing, empty or holds other
+    states. An authenticated user gets the success url while an anonymous user
+    gets the failure url.
+    """
+    request = RequestFactory().get("/callback/", data={"code": "some-code", "state": "unknown-state"})
+    request.user = factories.UserFactory() if is_authenticated else AnonymousUser()
+
+    middleware = SessionMiddleware(get_response=lambda x: x)
+    middleware.process_request(request)
+
+    if session_oidc_states is not None:
+        request.session["oidc_states"] = session_oidc_states
+    request.session.save()
+
+    with mock.patch("django.contrib.auth.authenticate") as mocked_authenticate:
+        response = OIDCAuthenticationCallbackView.as_view()(request)
+
+    mocked_authenticate.assert_not_called()
+    assert response.status_code == 302
+    if is_authenticated:
+        mocked_success_url.assert_called_once()
+        assert response.url == "/homepage/"
+    else:
+        mocked_failure_url.assert_called_once()
+        assert response.url == "/failure/"
+
+
+def _create_callback_request(settings, data, session_key=None):
+    """Build a callback request with a session, as the session middleware would."""
+    request = RequestFactory().get("/callback/", data=data)
+
+    if session_key is not None:
+        request.COOKIES = {settings.SESSION_COOKIE_NAME: session_key}
+
+    middleware = SessionMiddleware(get_response=lambda x: x)
+    middleware.process_request(request)
+
+    return request
+
+
+@responses.activate
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "success_url",
+    new_callable=mock.PropertyMock,
+    return_value="/homepage/",
+)
+def test_view_callback_replay_after_successful_login(mocked_success_url, settings, monkeypatch):
+    """
+    Reproduce a callback replay after a successful login.
+
+    A first callback request consumes the state and logs the user in, then the
+    same browser session replays the callback url. The replay should redirect
+    to the success url without trying to authenticate.
+    """
+    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
+    settings.OIDC_OP_USER_ENDPOINT = "http://oidc.endpoint.test/userinfo"
+
+    def verify_token_mocked(*args, **kwargs):
+        """Return payload claims without token verification."""
+        return {"sub": "123", "email": "test@example.com"}
+
+    monkeypatch.setattr(OIDCAuthenticationBackend, "verify_token", verify_token_mocked)
+
+    responses.add(
+        responses.POST,
+        settings.OIDC_OP_TOKEN_ENDPOINT,
+        json={"access_token": "test-access-token"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        settings.OIDC_OP_USER_ENDPOINT,
+        json={"sub": "123", "email": "test@example.com"},
+        status=200,
+    )
+
+    # - First callback: a valid state is stored in the session and consumed
+    request = _create_callback_request(settings, {"code": "some-code", "state": "known-state"})
+    request.user = AnonymousUser()
+
+    request.session["oidc_states"] = {"known-state": {"nonce": "nonce", "code_verifier": None}}
+    request.session.save()
+
+    response = OIDCAuthenticationCallbackView.as_view()(request)
+
+    assert response.status_code == 302
+    assert response.url == "/homepage/"
+    # The first callback consumed the state
+    assert request.session["oidc_states"] == {}
+    user = UserModel.objects.get(email="test@example.com")
+
+    # - Replay: same browser session, the state is now gone from the session.
+    # The login cycled the session key, the replayed request carries the
+    # updated session cookie and resolves to the authenticated user.
+    request.session.save()
+    replay_request = _create_callback_request(
+        settings, {"code": "some-code", "state": "known-state"}, session_key=request.session.session_key
+    )
+    replay_request.user = get_user(replay_request)
+    assert replay_request.user == user
+    mocked_success_url.reset_mock()
+
+    with mock.patch("django.contrib.auth.authenticate") as mocked_authenticate:
+        replay_response = OIDCAuthenticationCallbackView.as_view()(replay_request)
+
+    mocked_success_url.assert_called_once()
+    mocked_authenticate.assert_not_called()
+    # The authorization code should only have been exchanged once
+    responses.assert_call_count(settings.OIDC_OP_TOKEN_ENDPOINT, 1)
+    assert replay_response.status_code == 302
+    assert replay_response.url == "/homepage/"
+    # The login should still be effective
+    assert get_user(replay_request) == user
+
+
+@responses.activate
+@mock.patch.object(
+    OIDCAuthenticationCallbackView,
+    "failure_url",
+    new_callable=mock.PropertyMock,
+    return_value="/failure/",
+)
+@mock.patch.object(OIDCAuthenticationBackend, "verify_token", return_value=None)
+def test_view_callback_replay_after_failed_login(mocked_verify_token, mocked_failure_url, settings):
+    """
+    Reproduce a callback replay after a failed login.
+
+    A first callback request consumes the state but fails to authenticate the
+    user, then the same browser session replays the callback url. The replay
+    should redirect to the failure url without trying to exchange the code.
+    """
+    settings.OIDC_OP_TOKEN_ENDPOINT = "http://oidc.endpoint.test/token"
+
+    responses.add(
+        responses.POST,
+        settings.OIDC_OP_TOKEN_ENDPOINT,
+        json={"access_token": "test-access-token"},
+        status=200,
+    )
+
+    # - First callback: the state is consumed but the login fails
+    request = _create_callback_request(settings, {"code": "some-code", "state": "known-state"})
+    request.user = AnonymousUser()
+
+    request.session["oidc_states"] = {"known-state": {"nonce": "nonce", "code_verifier": None}}
+    request.session.save()
+
+    response = OIDCAuthenticationCallbackView.as_view()(request)
+
+    # The token endpoint was reached but verify_token returned no payload
+    mocked_verify_token.assert_called_once()
+    assert response.status_code == 302
+    assert response.url == "/failure/"
+    # The first callback consumed the state but did not log the user in
+    assert request.session["oidc_states"] == {}
+    mocked_failure_url.reset_mock()
+
+    # - Replay: same browser session, still anonymous
+    replay_request = _create_callback_request(
+        settings, {"code": "some-code", "state": "known-state"}, session_key=request.session.session_key
+    )
+    replay_request.user = get_user(replay_request)
+    assert not replay_request.user.is_authenticated
+
+    with mock.patch("django.contrib.auth.authenticate") as mocked_authenticate:
+        replay_response = OIDCAuthenticationCallbackView.as_view()(replay_request)
+
+    mocked_failure_url.assert_called_once()
+    mocked_authenticate.assert_not_called()
+    # The authorization code should only have been exchanged once
+    responses.assert_call_count(settings.OIDC_OP_TOKEN_ENDPOINT, 1)
+    assert replay_response.status_code == 302
+    assert replay_response.url == "/failure/"
